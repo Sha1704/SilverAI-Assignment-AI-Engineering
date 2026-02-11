@@ -1,3 +1,4 @@
+# app/handbook.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +9,10 @@ from llm_base import LLMClient
 from retrieve import retrieve_context
 
 
+def as_text(resp) -> str:
+    return getattr(resp, "text", resp)
+
+
 def word_count(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text))
 
@@ -15,6 +20,21 @@ def word_count(text: str) -> int:
 def clean_heading(s: str) -> str:
     s = re.sub(r"[^\w\s\-:]", "", s).strip()
     return s[:120] if s else "Section"
+
+
+def get_pages_from_hit(hit: dict) -> List[int]:
+    pages = hit.get("pages")
+    if pages is None:
+        pages = (hit.get("metadata") or {}).get("pages")
+    if not pages:
+        return []
+    out: List[int] = []
+    for p in pages:
+        try:
+            out.append(int(p))
+        except Exception:
+            pass
+    return out
 
 
 @dataclass
@@ -33,15 +53,18 @@ Topic: {topic}
 
 Return ONLY a numbered outline with 12-18 sections, each as a short heading.
 Example:
-1. ...
-2. ...
+1. Introduction
+2. Key Concepts
+3. ...
 """
-    text = llm.generate(prompt)
+    text = as_text(llm.generate(prompt))
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     outline: List[str] = []
+
     for ln in lines:
-        m = re.match(r"^\s*\d+[\).\-\:]\s*(.+)$", ln)
+        # accept "1. X", "1) X", "1 - X", "1: X"
+        m = re.match(r"^\s*\d+\s*[\).\-\:]\s*(.+)$", ln)
         if m:
             outline.append(clean_heading(m.group(1)))
 
@@ -75,19 +98,12 @@ def generate_handbook_markdown(
     top_k_context: int = 8,
     progress_cb: Optional[Callable[[str, float], None]] = None,
 ) -> HandbookResult:
-    """
-    LongWriter-style orchestration:
-    - Outline first
-    - Expand section by section
-    - Keep a rolling 'memory' summary to maintain coherence
-    - Stop when >= target_words
-    - Add a conclusion once at the end
-    """
     outline = generate_outline(llm, topic)
 
     title = f"{topic} — Handbook"
     md_parts: List[str] = [f"# {title}\n"]
 
+    # Table of Contents
     md_parts.append("## Table of Contents\n")
     for i, h in enumerate(outline, start=1):
         anchor = re.sub(r"[^a-z0-9\- ]", "", h.lower()).replace(" ", "-")
@@ -112,14 +128,16 @@ def generate_handbook_markdown(
                 document_id=document_id,
             )
 
+        allowed_pages = sorted({p for h in context_hits for p in get_pages_from_hit(h)})
+
         context_block = ""
         if context_hits:
             blocks: List[str] = []
             for h in context_hits:
-                pages = h.get("metadata", {}).get("pages", [])
-                blocks.append(
-                    f"[pages={pages} sim={h.get('similarity', 0):.3f}]\n{h.get('content','')}"
-                )
+                pages = get_pages_from_hit(h)
+                sim = float(h.get("similarity", 0.0) or 0.0)
+                content = h.get("content", "") or ""
+                blocks.append(f"[pages={pages} sim={sim:.3f}]\n{content}".strip())
             context_block = "\n\n---\n\n".join(blocks)
 
         prompt = f"""
@@ -133,7 +151,11 @@ You MUST:
 - Include subsections (###) and bullet lists where useful
 - Be detailed, practical, and explanatory
 - Ground content in the provided sources when available
-- When referencing sources, add citations like: (PDF p. X)
+
+Citation rules:
+- Cite ONLY from these pages: {allowed_pages}
+- Use the format (PDF p. X)
+- If sources do not support a claim, say so clearly.
 
 Continuity notes from previous sections:
 {memory[:2000]}
@@ -143,7 +165,7 @@ Source excerpts:
 
 Now write this section:
 - Start with "## {heading}"
-- Aim for 1200-1800 words for this section (if possible)
+- Aim for 1200-1800 words (if possible)
 """
 
         if progress_cb:
@@ -152,20 +174,21 @@ Now write this section:
                 (idx - 0.5) / max(len(outline), 1),
             )
 
-        section_md = llm.generate(prompt).strip()
+        section_md = as_text(llm.generate(prompt)).strip()
         if not section_md.startswith("## "):
             section_md = f"## {heading}\n\n" + section_md
 
         md_parts.append(section_md)
         total_words = word_count("\n\n".join(md_parts))
 
+        # Rolling memory summary
         memory_prompt = f"""
 Summarize the key points from the latest section in 6-10 bullet points, concise.
 
 Section text:
 {section_md[:12000]}
 """
-        memory = llm.generate(memory_prompt).strip()
+        memory = as_text(llm.generate(memory_prompt)).strip()
 
         if progress_cb:
             progress_cb(f"Progress: {total_words} words", idx / max(len(outline), 1))
@@ -173,7 +196,7 @@ Section text:
         if total_words >= target_words:
             break
 
-    # Conclusion ONCE, after the loop
+    # Conclusion once
     if progress_cb:
         progress_cb("Generating final conclusion…", 1.0)
 
@@ -189,7 +212,7 @@ Requirements:
 - Add a brief glossary of 8-12 terms
 - End with a complete final sentence (no cutoff)
 """
-    conclusion_md = llm.generate(conclusion_prompt).strip()
+    conclusion_md = as_text(llm.generate(conclusion_prompt)).strip()
     if not conclusion_md.startswith("## "):
         conclusion_md = "## Conclusion\n\n" + conclusion_md
     md_parts.append(conclusion_md)
