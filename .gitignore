@@ -1,3 +1,4 @@
 .env
 venv311/
 __pycache__/
+handbook_generator_full_context_updated.md
